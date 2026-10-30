@@ -7,6 +7,9 @@ development (SQLite) and production (PostgreSQL). See backend/.env.example.
 import os
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import parse_qsl, unquote, urlsplit
+
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -36,9 +39,15 @@ if _env_file.exists():
         key, _, value = line.partition("=")
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
+# Render sets RENDER=true, so debug stays off there even if DJANGO_DEBUG is forgotten.
+DEBUG = env_bool("DJANGO_DEBUG", not env("RENDER"))
 SECRET_KEY = env("DJANGO_SECRET_KEY", "dev-only-insecure-key-change-me-in-production")
-DEBUG = env_bool("DJANGO_DEBUG", True)
+if not DEBUG and SECRET_KEY.startswith("dev-only-"):
+    raise ImproperlyConfigured("Set DJANGO_SECRET_KEY to a long random string in production.")
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
+# Render gives each web service its own hostname, e.g. asmah-backend.onrender.com.
+if env("RENDER_EXTERNAL_HOSTNAME"):
+    ALLOWED_HOSTS.append(env("RENDER_EXTERNAL_HOSTNAME"))
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -57,6 +66,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -84,8 +94,25 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "asmah.wsgi.application"
 
-# Database: SQLite by default, PostgreSQL when POSTGRES_DB is set.
-if env("POSTGRES_DB"):
+# Database: PostgreSQL when DATABASE_URL (as Render provides) or POSTGRES_DB is set,
+# otherwise SQLite.
+if env("DATABASE_URL"):
+    url = urlsplit(env("DATABASE_URL"))
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": unquote(url.path.lstrip("/")),
+            "USER": unquote(url.username or ""),
+            "PASSWORD": unquote(url.password or ""),
+            "HOST": url.hostname or "",
+            "PORT": str(url.port or 5432),
+            # Options in the URL, such as ?sslmode=require, go straight to the driver.
+            "OPTIONS": dict(parse_qsl(url.query)),
+            "CONN_MAX_AGE": int(env("DB_CONN_MAX_AGE", "60")),
+            "CONN_HEALTH_CHECKS": True,
+        }
+    }
+elif env("POSTGRES_DB"):
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.postgresql",
@@ -121,6 +148,44 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    # WhiteNoise serves the admin's CSS and JS in production after `collectstatic`.
+    "staticfiles": {"BACKEND": "whitenoise.storage.CompressedStaticFilesStorage"},
+}
+
+# Borrower photos and the logo go to Supabase Storage when it is set up, because a host
+# like Render wipes its own disk on every deploy. The bucket must be public so the
+# images load in the browser without signing in to Supabase.
+if env("SUPABASE_URL"):
+    from botocore.config import Config
+
+    # Accept the project URL or the S3 endpoint the dashboard shows (…/storage/v1/s3).
+    _supabase = env("SUPABASE_URL").rstrip("/").removesuffix("/storage/v1/s3")
+    _bucket = env("SUPABASE_BUCKET", "media")
+    STORAGES["default"] = {
+        "BACKEND": "storages.backends.s3.S3Storage",
+        "OPTIONS": {
+            "bucket_name": _bucket,
+            "endpoint_url": f"{_supabase}/storage/v1/s3",
+            "region_name": env("SUPABASE_S3_REGION", "us-east-1"),
+            "access_key": env("SUPABASE_S3_ACCESS_KEY_ID"),
+            "secret_key": env("SUPABASE_S3_SECRET_ACCESS_KEY"),
+            # Image links use the bucket's public address, so they never expire.
+            "custom_domain": f"{urlsplit(_supabase).netloc}/storage/v1/object/public/{_bucket}",
+            "querystring_auth": False,
+            # Two uploads with the same file name get different names instead of replacing each other.
+            "file_overwrite": False,
+            "client_config": Config(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+                # Only send the checksums S3 itself requires; not every S3-compatible
+                # service accepts the extra ones newer boto3 versions add by default.
+                request_checksum_calculation="when_required",
+                response_checksum_validation="when_required",
+            ),
+        },
+    }
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 BACKUP_DIR = Path(env("BACKUP_DIR", str(BASE_DIR / "backups")))
@@ -161,3 +226,10 @@ if not DEBUG:
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
+    # Print warnings and errors (with tracebacks) to the console so they show in the host's logs.
+    LOGGING = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "handlers": {"console": {"class": "logging.StreamHandler", "level": "WARNING"}},
+        "root": {"handlers": ["console"], "level": "WARNING"},
+    }

@@ -1,0 +1,35 @@
+# Render Blueprint for the Asmah Finance API.
+# In Render: New > Blueprint > choose this repository. Render asks for the values marked sync: false.
+services:
+  - type: web
+    name: asmah-backend
+    runtime: python
+    # Same region as the asmahfinancedatabase Postgres, so the internal database URL works.
+    region: virginia
+    plan: free
+    buildCommand: bash build.sh
+    startCommand: gunicorn asmah.wsgi --workers 2 --timeout 60
+    healthCheckPath: /api/health/
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DJANGO_DEBUG
+        value: "false"
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: TIME_ZONE
+        value: Africa/Dar_es_Salaam
+      # The database's "Internal Database URL" from its Connect menu in Render.
+      - key: DATABASE_URL
+        sync: false
+      # Supabase Storage for borrower photos and the logo (see README.md).
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_S3_REGION
+        sync: false
+      - key: SUPABASE_S3_ACCESS_KEY_ID
+        sync: false
+      - key: SUPABASE_S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: media

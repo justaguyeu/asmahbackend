@@ -45,7 +45,9 @@ def _header(story, title, subtitle):
     logo_cell = ""
     if s.logo:
         try:
-            logo_cell = Image(s.logo.path, width=16 * mm, height=16 * mm, kind="proportional")
+            # Read through the storage so this works whether the logo is on disk or in the cloud.
+            with s.logo.open("rb") as fh:
+                logo_cell = Image(io.BytesIO(fh.read()), width=16 * mm, height=16 * mm, kind="proportional")
         except Exception:
             logo_cell = ""
     contact = " · ".join(x for x in [s.address, s.phone, s.email] if x)
