@@ -15,7 +15,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 def env(name, default=None):
-    return os.environ.get(name, default)
+    # A key left blank in .env (e.g. "SUPABASE_URL=") counts as not set.
+    return os.environ.get(name) or default
 
 
 def env_bool(name, default=False):
