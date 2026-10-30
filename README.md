@@ -1,6 +1,6 @@
-# Asmah Finance – backend
+# ASK Company – backend
 
-Django REST API for Asmah Finance. The Next.js frontend forwards `/api/...` to it.
+Django REST API for ASK Company. The Next.js frontend forwards `/api/...` to it.
 
 ## Run locally
 

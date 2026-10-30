@@ -52,7 +52,7 @@ class Command(BaseCommand):
             admin.save()
 
         s = BusinessSettings.load()
-        s.business_name = "Asmah Finance"
+        s.business_name = "ASK Company"
         s.phone = "+255 700 000 001"
         s.email = "info@asmahfinance.co.tz"
         s.monthly_lending_target = Decimal("8000000")

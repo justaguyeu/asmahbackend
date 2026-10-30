@@ -1,5 +1,5 @@
 """
-Django settings for Asmah Finance.
+Django settings for ASK Company.
 
 Configuration comes from environment variables so the same code runs in
 development (SQLite) and production (PostgreSQL). See backend/.env.example.
@@ -220,7 +220,7 @@ EMAIL_PORT = int(env("EMAIL_PORT", "587"))
 EMAIL_HOST_USER = env("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", "")
 EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", True)
-DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", "Asmah Finance <no-reply@asmahfinance.local>")
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", "ASK Company <no-reply@askcompany.local>")
 FRONTEND_URL = env("FRONTEND_URL", "http://localhost:3000")
 
 if not DEBUG:

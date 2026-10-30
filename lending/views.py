@@ -491,7 +491,7 @@ class ReportExportView(APIView):
         summary = reports.period_summary(start, end)
         rows, totals = reports.monthly_rows(start, end)
         borrowers = reports.borrowers_in_period(start, end)
-        name = f"asmah-report-{start:%Y%m%d}-{end:%Y%m%d}"
+        name = f"ask-company-report-{start:%Y%m%d}-{end:%Y%m%d}"
         log_activity(request.user, "report_exported", "report", "", f"Exported {fmt.upper()} report {start} to {end}")
         if fmt == "pdf":
             return file_response(exports.period_pdf(summary, rows, totals, borrowers), f"{name}.pdf",
@@ -524,7 +524,7 @@ class BackupView(APIView):
                                 exclude=["accounts.user"] if request.query_params.get("no_users") else [])
         log_activity(request.user, "backup_downloaded", "backup", "", "Downloaded a database backup")
         stamp = timezone.localtime().strftime("%Y%m%d-%H%M")
-        return file_response(out.getvalue(), f"asmah-backup-{stamp}.json", "application/json")
+        return file_response(out.getvalue(), f"ask-company-backup-{stamp}.json", "application/json")
 
 
 class HealthView(APIView):

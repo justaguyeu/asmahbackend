@@ -1,4 +1,4 @@
-# Render Blueprint for the Asmah Finance API.
+# Render Blueprint for the ASK Company API.
 # In Render: New > Blueprint > choose this repository. Render asks for the values marked sync: false.
 services:
   - type: web

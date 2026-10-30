@@ -29,7 +29,7 @@ class LoginSerializer(TokenObtainPairSerializer):
         data = super().validate(attrs)
         if not self.user.is_superuser:
             raise serializers.ValidationError(
-                {"detail": "Only the system administrator can sign in to Asmah Finance."})
+                {"detail": "Only the system administrator can sign in to ASK Company."})
         data["user"] = MeSerializer(self.user).data
         return data
 

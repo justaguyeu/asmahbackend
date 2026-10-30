@@ -6,5 +6,5 @@ from .models import User
 
 @admin.register(User)
 class AsmahUserAdmin(UserAdmin):
-    fieldsets = UserAdmin.fieldsets + (("Asmah Finance", {"fields": ("phone",)}),)
+    fieldsets = UserAdmin.fieldsets + (("ASK Company", {"fields": ("phone",)}),)
     list_display = ("username", "email", "first_name", "last_name", "is_superuser", "is_active")

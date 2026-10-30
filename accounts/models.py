@@ -3,7 +3,7 @@ from django.db import models
 
 
 class User(AbstractUser):
-    """Login account. Asmah Finance has a single user: the Django superuser.
+    """Login account. ASK Company has a single user: the Django superuser.
     Only superusers can sign in to the app or call the API."""
 
     phone = models.CharField(max_length=30, blank=True)

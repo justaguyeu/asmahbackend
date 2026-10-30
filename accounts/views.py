@@ -73,7 +73,7 @@ class PasswordResetRequestView(APIView):
             token = default_token_generator.make_token(user)
             link = f"{settings.FRONTEND_URL}/reset-password?uid={uid}&token={token}"
             send_mail(
-                "Reset your Asmah Finance password",
+                "Reset your ASK Company password",
                 f"Hello {user.display_name},\n\nUse this link to set a new password:\n{link}\n\n"
                 "If you did not ask for this, you can ignore this email.",
                 settings.DEFAULT_FROM_EMAIL,

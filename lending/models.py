@@ -33,7 +33,7 @@ class AmountType(models.TextChoices):
 class BusinessSettings(models.Model):
     """Single row holding business details, lending defaults and targets."""
 
-    business_name = models.CharField(max_length=120, default="Asmah Finance")
+    business_name = models.CharField(max_length=120, default="ASK Company")
     logo = models.ImageField(upload_to="logo/", blank=True, null=True)
     phone = models.CharField(max_length=40, blank=True)
     email = models.EmailField(blank=True)

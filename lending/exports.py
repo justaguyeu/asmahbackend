@@ -223,7 +223,7 @@ def period_xlsx(summary, rows, totals, borrowers) -> bytes:
 def period_pdf(summary, rows, totals, borrowers) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=12 * mm, rightMargin=12 * mm,
-                            topMargin=14 * mm, bottomMargin=14 * mm, title="Asmah Finance report")
+                            topMargin=14 * mm, bottomMargin=14 * mm, title="ASK Company report")
     st = _styles()
     story = []
     _header(story, "Lending report", f"{summary['start']:%d %b %Y} – {summary['end']:%d %b %Y}")
