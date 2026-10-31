@@ -15,10 +15,12 @@ the order penalty -> interest -> principal. Profit = interest + penalties
 actually collected + processing fees (deducted when the money is given out).
 """
 import calendar
+import time
 from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 from django.db import transaction
+from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
 from .models import ZERO, AmountType, BusinessSettings, Frequency, Installment, InterestType, Loan, Payment
@@ -256,13 +258,31 @@ def recalculate_loan(loan: Loan, today: date | None = None) -> Loan:
                 loan.status = Loan.Status.DEFAULTED if limit and days_late > limit else Loan.Status.OVERDUE
             else:
                 loan.status = Loan.Status.ACTIVE
+    loan.checked_on = today
     loan.save()
     return loan
 
 
+# How long one request may spend on the daily refresh before answering; the next requests go on
+# where it stopped. Keeps the first page of the day quick even on a slow server.
+REFRESH_BUDGET_SECONDS = 2.0
+
+
+def loans_to_refresh(today: date):
+    """Open loans that the passing of days can change and that were not checked today. Only an
+    unpaid installment that is already past its due date makes a loan late, adds its (one-off)
+    penalty or moves it towards "defaulted"; every other open loan comes out the same."""
+    behind = Installment.objects.filter(loan=OuterRef("pk"), due_date__lt=today).exclude(
+        status=Installment.Status.PAID)
+    return (Loan.objects.exclude(status__in=[Loan.Status.VOID, Loan.Status.COMPLETED])
+            .exclude(checked_on=today).filter(Exists(behind)))
+
+
 def refresh_open_loans(today: date | None = None, force=False) -> int:
-    """Re-check every open loan (statuses and penalties change as days pass).
-    Runs at most once a day unless forced; also available as a management command."""
+    """Bring open loans up to date (statuses and penalties change as days pass). Each loan is
+    saved on its own and marked checked_on=today, so the work is shared by all server processes
+    and survives a restart; a request spends at most REFRESH_BUDGET_SECONDS on it.
+    force=True (manage.py refresh_loans) re-checks every open loan in one go."""
     from django.core.cache import cache
 
     today = today or timezone.localdate()
@@ -273,11 +293,17 @@ def refresh_open_loans(today: date | None = None, force=False) -> int:
     if not cache.add(lock_key, True, 120):  # another request is already doing it
         return 0
     try:
+        if force:
+            loans = Loan.objects.exclude(status__in=[Loan.Status.VOID, Loan.Status.COMPLETED])
+        else:
+            loans = loans_to_refresh(today)
+        stop_at = time.monotonic() + REFRESH_BUDGET_SECONDS
         count = 0
-        with transaction.atomic():
-            for loan in Loan.objects.exclude(status__in=[Loan.Status.VOID, Loan.Status.COMPLETED]):
-                recalculate_loan(loan, today)
-                count += 1
+        for loan in list(loans.order_by("id")):
+            recalculate_loan(loan, today)
+            count += 1
+            if not force and time.monotonic() > stop_at:
+                return count  # out of time (at least one loan done): the next request carries on
         cache.set(done_key, True, 60 * 60 * 6)
         return count
     finally:

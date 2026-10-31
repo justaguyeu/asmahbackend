@@ -40,6 +40,7 @@ def _styles():
 
 
 def _header(story, title, subtitle):
+    """Letterhead and title. Returns the business settings, so a document reads them once."""
     s = BusinessSettings.load()
     st = _styles()
     logo_cell = ""
@@ -58,6 +59,7 @@ def _header(story, title, subtitle):
               Table([[""]], colWidths=["100%"], rowHeights=[2],
                     style=[("BACKGROUND", (0, 0), (-1, -1), LIME)]),
               Spacer(1, 8), Paragraph(title, st["h"]), Paragraph(subtitle, st["sub"]), Spacer(1, 6)]
+    return s
 
 
 def _table(rows, widths=None, money_cols=(), header=True):
@@ -86,19 +88,19 @@ def receipt_pdf(payment) -> bytes:
                             topMargin=12 * mm, bottomMargin=12 * mm, title=f"Receipt {payment.receipt_no}")
     st = _styles()
     story = []
-    _header(story, f"Payment receipt · {payment.receipt_no}", f"Date: {payment.date:%d %b %Y}")
+    sym = _header(story, f"Payment receipt · {payment.receipt_no}", f"Date: {payment.date:%d %b %Y}").currency_symbol
     loan = payment.loan
     rows = [
         ["Received from", loan.borrower.full_name],
         ["Phone", loan.borrower.phone or "-"],
         ["Loan", loan.reference],
-        ["Amount paid", fmt(payment.amount)],
+        ["Amount paid", fmt(payment.amount, sym)],
         ["Method", payment.get_method_display()],
         ["Reference", payment.reference or "-"],
-        ["Applied to interest", fmt(payment.interest_portion)],
-        ["Applied to principal", fmt(payment.principal_portion)],
-        ["Applied to penalty", fmt(payment.penalty_portion)],
-        ["Balance after payment", fmt(loan.balance)],
+        ["Applied to interest", fmt(payment.interest_portion, sym)],
+        ["Applied to principal", fmt(payment.principal_portion, sym)],
+        ["Applied to penalty", fmt(payment.penalty_portion, sym)],
+        ["Balance after payment", fmt(loan.balance, sym)],
         ["Received by", payment.received_by.display_name if payment.received_by else "-"],
     ]
     t = _table(rows, widths=[45 * mm, None], header=False)
@@ -119,21 +121,22 @@ def statement_pdf(borrower) -> bytes:
                             topMargin=15 * mm, bottomMargin=15 * mm, title=f"Statement {borrower.full_name}")
     st = _styles()
     story = []
-    _header(story, f"Borrower statement · {borrower.full_name}",
-            f"Phone: {borrower.phone or '-'} · NIDA: {borrower.national_id or '-'} · Printed {date.today():%d %b %Y}")
+    sym = _header(story, f"Borrower statement · {borrower.full_name}",
+            f"Phone: {borrower.phone or '-'} · NIDA: {borrower.national_id or '-'} · Printed {date.today():%d %b %Y}").currency_symbol
     loans = borrower.loans.exclude(status="void").order_by("date_issued")
     rows = [["Loan", "Issued", "Principal", "Interest", "Penalty", "Paid", "Balance", "Status"]]
     for l in loans:
-        rows.append([l.reference, f"{l.date_issued:%d %b %Y}", fmt(l.principal), fmt(l.total_interest),
-                     fmt(l.total_penalty), fmt(l.total_paid), fmt(l.balance), l.get_status_display()])
+        rows.append([l.reference, f"{l.date_issued:%d %b %Y}", fmt(l.principal, sym), fmt(l.total_interest, sym),
+                     fmt(l.total_penalty, sym), fmt(l.total_paid, sym), fmt(l.balance, sym), l.get_status_display()])
     story += [Paragraph("Loans", st["h"]), _table(rows, money_cols=(2, 3, 4, 5, 6))]
     pay_rows = [["Receipt", "Date", "Loan", "Method", "Amount"]]
     for l in loans:
         for p in l.payments.filter(is_void=False).order_by("date"):
-            pay_rows.append([p.receipt_no, f"{p.date:%d %b %Y}", l.reference, p.get_method_display(), fmt(p.amount)])
+            pay_rows.append([p.receipt_no, f"{p.date:%d %b %Y}", l.reference, p.get_method_display(),
+                             fmt(p.amount, sym)])
     story += [Paragraph("Payments", st["h"]), _table(pay_rows, money_cols=(4,))]
     total_balance = sum((l.balance for l in loans if l.status not in ("completed",)), Decimal(0))
-    story += [Spacer(1, 10), Paragraph(f"<b>Total still owed: {fmt(total_balance)}</b>", st["body"])]
+    story += [Spacer(1, 10), Paragraph(f"<b>Total still owed: {fmt(total_balance, sym)}</b>", st["body"])]
     doc.build(story)
     return buf.getvalue()
 
@@ -226,8 +229,8 @@ def period_pdf(summary, rows, totals, borrowers) -> bytes:
                             topMargin=14 * mm, bottomMargin=14 * mm, title="ASK Company report")
     st = _styles()
     story = []
-    _header(story, "Lending report", f"{summary['start']:%d %b %Y} – {summary['end']:%d %b %Y}")
-    cards = [[label, fmt(summary[key])] for key, label in SUMMARY_LABELS]
+    sym = _header(story, "Lending report", f"{summary['start']:%d %b %Y} – {summary['end']:%d %b %Y}").currency_symbol
+    cards = [[label, fmt(summary[key], sym)] for key, label in SUMMARY_LABELS]
     cards += [[label, (f"{summary[key]}%" if key == "collection_rate" else str(summary[key]))
                if summary[key] is not None else "-"] for key, label in COUNT_LABELS]
     t = _table(cards, widths=[90 * mm, 50 * mm], money_cols=(1,), header=False)
@@ -235,16 +238,16 @@ def period_pdf(summary, rows, totals, borrowers) -> bytes:
     t.setStyle(TableStyle([("FONTNAME", (0, idx), (1, idx), "Helvetica-Bold"),
                            ("BACKGROUND", (0, idx), (1, idx), SOFT)]))
     story += [t, Paragraph("Month by month", st["h"])]
-    table_rows = [MONTH_HEAD] + [[r["label"]] + [fmt(r[k], "") for k in MONTH_KEYS] for r in rows]
-    table_rows.append(["TOTAL"] + [fmt(totals[k], "") for k in MONTH_KEYS])
+    table_rows = [MONTH_HEAD] + [[r["label"]] + [fmt(r[k], sym) for k in MONTH_KEYS] for r in rows]
+    table_rows.append(["TOTAL"] + [fmt(totals[k], sym) for k in MONTH_KEYS])
     mt = _table(table_rows, money_cols=range(1, 8))
     mt.setStyle(TableStyle([("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 7.5)]))
     story.append(mt)
     if borrowers:
         story.append(Paragraph("Borrowers active in this period", st["h"]))
         b_rows = [["Name", "Phone", "Status", "Borrowed", "Paid", "Balance"]]
-        b_rows += [[b["full_name"], b["phone"] or "-", b["status"].title(), fmt(b["borrowed"], ""),
-                    fmt(b["paid"], ""), fmt(b["balance"], "")] for b in borrowers]
+        b_rows += [[b["full_name"], b["phone"] or "-", b["status"].title(), fmt(b["borrowed"], sym),
+                    fmt(b["paid"], sym), fmt(b["balance"], sym)] for b in borrowers]
         story.append(_table(b_rows, money_cols=(3, 4, 5)))
     doc.build(story)
     return buf.getvalue()

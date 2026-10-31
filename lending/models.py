@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.db import models
-from django.db.models import Sum
+from django.db.models import Exists, OuterRef, Sum
 from django.utils import timezone
 
 ZERO = Decimal("0")
@@ -109,12 +109,24 @@ class Borrower(models.Model):
 
     @property
     def status(self):
+        if hasattr(self, "status_lost"):  # worked out in the list's own query, see with_status()
+            return "defaulted" if self.status_lost else "late" if self.status_late else "good"
         statuses = set(self.live_loans().filter(balance__gt=0).values_list("status", flat=True))
         if statuses & {Loan.Status.DEFAULTED, Loan.Status.WRITTEN_OFF}:
             return "defaulted"
         if Loan.Status.OVERDUE in statuses:
             return "late"
         return "good"
+
+
+def with_status(borrowers):
+    """Adds what Borrower.status needs to a borrower query, so a list of borrowers takes one
+    query instead of one more per borrower."""
+    owing = Loan.objects.filter(borrower=OuterRef("pk"), balance__gt=0).exclude(status=Loan.Status.VOID)
+    return borrowers.annotate(
+        status_lost=Exists(owing.filter(status__in=[Loan.Status.DEFAULTED, Loan.Status.WRITTEN_OFF])),
+        status_late=Exists(owing.filter(status=Loan.Status.OVERDUE)),
+    )
 
 
 class Loan(models.Model):
@@ -155,6 +167,8 @@ class Loan(models.Model):
     void_reason = models.CharField(max_length=255, blank=True)
     notes = models.TextField(blank=True)
     completed_on = models.DateField(null=True, blank=True)
+    checked_on = models.DateField(null=True, blank=True, editable=False,
+                                  help_text="Day services.recalculate_loan() last brought this loan up to date")
     created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True,
                                    on_delete=models.SET_NULL, related_name="+")

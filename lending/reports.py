@@ -8,18 +8,24 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, TruncMonth
 from django.utils import timezone
 
-from .models import ZERO, Borrower, BusinessSettings, Installment, Loan, Payment
+from .models import ZERO, Borrower, BusinessSettings, Installment, Loan, Payment, with_status
 
 DEC = DecimalField(max_digits=16, decimal_places=2)
 OPEN_STATUSES = [Loan.Status.ACTIVE, Loan.Status.OVERDUE, Loan.Status.DEFAULTED, Loan.Status.WRITTEN_OFF]
 LOST_STATUSES = [Loan.Status.DEFAULTED, Loan.Status.WRITTEN_OFF]
 
 
+def _money(expr, when=None):
+    """A sum of money for aggregate()/annotate(): 0 rather than None when nothing matches.
+    Several of these in one aggregate() cost one database query instead of one each."""
+    return Coalesce(Sum(expr, filter=when, output_field=DEC), ZERO, output_field=DEC)
+
+
 def _sum(qs, expr):
-    return qs.aggregate(v=Coalesce(Sum(expr, output_field=DEC), ZERO, output_field=DEC))["v"]
+    return qs.aggregate(v=_money(expr))["v"]
 
 
 def live_loans():
@@ -60,42 +66,43 @@ def pct_change(current, previous):
 
 
 def period_summary(start: date, end: date) -> dict:
-    loans = live_loans().filter(date_issued__range=(start, end))
-    pays = live_payments().filter(date__range=(start, end))
-    insts = live_installments().filter(due_date__range=(start, end))
-
-    lent = _sum(loans, "principal")
-    fees = _sum(loans, "processing_fee")
-    interest = _sum(pays, "interest_portion")
-    penalties = _sum(pays, "penalty_portion")
-    principal_back = _sum(pays, "principal_portion")
-    collected = _sum(pays, "amount")
-    expected_interest = _sum(insts, "interest_due")
-    due_pi = _sum(insts, F("principal_due") + F("interest_due"))
-    paid_pi = _sum(insts, F("principal_paid") + F("interest_paid"))
-    overdue_amount = _sum(insts.filter(status=Installment.Status.OVERDUE), REMAINING)
+    # one query per table for all the figures (reports call this once per month or year)
+    lo = live_loans().filter(date_issued__range=(start, end)).aggregate(
+        lent=_money("principal"), fees=_money("processing_fee"), count=Count("id"),
+        outstanding=_money("balance", Q(status__in=OPEN_STATUSES)),
+        lost=_money("balance", Q(status__in=LOST_STATUSES)),
+        borrowers=Count("borrower", distinct=True))
+    pa = live_payments().filter(date__range=(start, end)).aggregate(
+        interest=_money("interest_portion"), penalties=_money("penalty_portion"),
+        principal=_money("principal_portion"), collected=_money("amount"), count=Count("id"))
+    ins = live_installments().filter(due_date__range=(start, end)).aggregate(
+        expected_interest=_money("interest_due"),
+        due=_money(F("principal_due") + F("interest_due")),
+        paid=_money(F("principal_paid") + F("interest_paid")),
+        overdue=_money(REMAINING, Q(status=Installment.Status.OVERDUE)))
+    fees, penalties, due_pi = lo["fees"], pa["penalties"], ins["due"]
 
     return {
         "start": start, "end": end,
-        "lent": lent,
-        "loans_issued": loans.count(),
-        "collected": collected,
-        "principal_collected": principal_back,
-        "interest_collected": interest,
+        "lent": lo["lent"],
+        "loans_issued": lo["count"],
+        "collected": pa["collected"],
+        "principal_collected": pa["principal"],
+        "interest_collected": pa["interest"],
         "penalties_collected": penalties,
         "fees_collected": fees,
         "fees_and_penalties": fees + penalties,
-        "profit": interest + penalties + fees,
-        "expected_interest": expected_interest,
-        "expected_profit": expected_interest + fees,
-        "outstanding": _sum(loans.filter(status__in=OPEN_STATUSES), "balance"),
-        "overdue_amount": overdue_amount,
-        "lost_amount": _sum(loans.filter(status__in=LOST_STATUSES), "balance"),
+        "profit": pa["interest"] + penalties + fees,
+        "expected_interest": ins["expected_interest"],
+        "expected_profit": ins["expected_interest"] + fees,
+        "outstanding": lo["outstanding"],
+        "overdue_amount": ins["overdue"],
+        "lost_amount": lo["lost"],
         "due_amount": due_pi,
-        "collection_rate": (paid_pi / due_pi * 100).quantize(Decimal("0.1")) if due_pi else None,
+        "collection_rate": (ins["paid"] / due_pi * 100).quantize(Decimal("0.1")) if due_pi else None,
         "new_borrowers": Borrower.objects.filter(created_at__date__range=(start, end)).count(),
-        "borrowers_served": loans.values("borrower").distinct().count(),
-        "payments_count": pays.count(),
+        "borrowers_served": lo["borrowers"],
+        "payments_count": pa["count"],
     }
 
 
@@ -136,7 +143,7 @@ def month_detail(year: int, month: int) -> dict:
     pays = live_payments().filter(date__range=(start, end)).select_related("loan__borrower")
     owing = (live_installments().filter(due_date__range=(start, end))
              .exclude(status=Installment.Status.PAID).select_related("loan__borrower")
-             .annotate(left=REMAINING).order_by("due_date"))
+             .annotate(left=REMAINING).order_by("due_date", "id"))  # id: same order on every load
     return {
         "summary": period_summary(start, end),
         "loans": [{"id": l.id, "reference": l.reference, "borrower": l.borrower.full_name,
@@ -158,16 +165,20 @@ def borrowers_in_period(start: date, end: date):
     active_loans = live_loans().filter(date_issued__lte=end).filter(
         Q(completed_on__isnull=True) | Q(completed_on__gte=start))
     ids = active_loans.values_list("borrower_id", flat=True).distinct()
-    rows = []
-    for b in Borrower.objects.filter(id__in=ids):
-        bl = live_loans().filter(borrower=b)
-        rows.append({
-            "id": b.id, "full_name": b.full_name, "phone": b.phone, "status": b.status,
-            "borrowed": _sum(bl.filter(date_issued__range=(start, end)), "principal"),
-            "paid": _sum(live_payments().filter(loan__borrower=b, date__range=(start, end)), "amount"),
-            "balance": _sum(bl.filter(status__in=OPEN_STATUSES), "balance"),
-        })
-    return rows
+
+    # one grouped query per figure for all borrowers, not three queries per borrower
+    def per_borrower(qs, key, expr):
+        return dict(qs.order_by().values(key).annotate(v=_money(expr)).values_list(key, "v"))
+
+    borrowed = per_borrower(live_loans().filter(borrower_id__in=ids, date_issued__range=(start, end)),
+                            "borrower_id", "principal")
+    paid = per_borrower(live_payments().filter(loan__borrower_id__in=ids, date__range=(start, end)),
+                        "loan__borrower_id", "amount")
+    balance = per_borrower(live_loans().filter(borrower_id__in=ids, status__in=OPEN_STATUSES),
+                           "borrower_id", "balance")
+    return [{"id": b.id, "full_name": b.full_name, "phone": b.phone, "status": b.status,
+             "borrowed": borrowed.get(b.id, ZERO), "paid": paid.get(b.id, ZERO), "balance": balance.get(b.id, ZERO)}
+            for b in with_status(Borrower.objects.filter(id__in=ids))]
 
 
 def _buckets(range_key: str, today: date):
@@ -189,15 +200,27 @@ def add_months_simple(d: date, months: int) -> date:
 
 def chart_series(range_key: str, today: date | None = None):
     today = today or timezone.localdate()
+    buckets = _buckets(range_key, today)
+    first, last = buckets[0][1], buckets[-1][2]
+    # two grouped queries for the whole chart (by day, or by month for 12m), not four per bar
+    by_month = range_key == "12m"
+
+    def grouped(qs, field, **sums):
+        bar = TruncMonth(field) if by_month else F(field)
+        return {r["bar"]: r for r in qs.order_by().annotate(bar=bar).values("bar").annotate(**sums)}
+
+    pays = grouped(live_payments().filter(date__range=(first, last)), "date", collected=_money("amount"),
+                   profit=_money(F("interest_portion") + F("penalty_portion")))
+    loans = grouped(live_loans().filter(date_issued__range=(first, last)), "date_issued",
+                    lent=_money("principal"), fees=_money("processing_fee"))
     series = []
-    for label, s, e in _buckets(range_key, today):
-        pays = live_payments().filter(date__range=(s, e))
-        loans = live_loans().filter(date_issued__range=(s, e))
+    for label, s, e in buckets:
+        p, lo = pays.get(s, {}), loans.get(s, {})
         series.append({
             "label": label, "start": s, "end": e,
-            "lent": _sum(loans, "principal"),
-            "collected": _sum(pays, "amount"),
-            "profit": _sum(pays, F("interest_portion") + F("penalty_portion")) + _sum(loans, "processing_fee"),
+            "lent": lo.get("lent", ZERO),
+            "collected": p.get("collected", ZERO),
+            "profit": p.get("profit", ZERO) + lo.get("fees", ZERO),
         })
     return series
 
@@ -229,20 +252,29 @@ def dashboard_data(range_key="7d") -> dict:
     open_loans = live_loans().filter(status__in=OPEN_STATUSES)
     overdue_insts = live_installments().filter(status=Installment.Status.OVERDUE)
 
+    # every open status in one grouped query
+    by_status = {r["status"]: r for r in open_loans.order_by().values("status")
+                 .annotate(amount=_money("balance"), count=Count("id"))}
+    total_outstanding = sum((r["amount"] for r in by_status.values()), ZERO)
     breakdown = []
-    total_outstanding = _sum(open_loans, "balance")
     for status, label in [(Loan.Status.ACTIVE, "On time"), (Loan.Status.OVERDUE, "Overdue"),
                           (Loan.Status.DEFAULTED, "Defaulted"), (Loan.Status.WRITTEN_OFF, "Written off")]:
-        qs = open_loans.filter(status=status)
-        amount = _sum(qs, "balance")
-        breakdown.append({"key": status, "label": label, "amount": amount, "count": qs.count(),
+        amount, count = by_status.get(status, {}).get("amount", ZERO), by_status.get(status, {}).get("count", 0)
+        breakdown.append({"key": status, "label": label, "amount": amount, "count": count,
                           "percent": (amount / total_outstanding * 100).quantize(Decimal("1"))
                           if total_outstanding else 0})
+    all_loans = live_loans().aggregate(lent=_money("principal"), fees=_money("processing_fee"))
+    all_pays = live_payments().aggregate(
+        collected=_money("amount"), profit=_money(F("interest_portion") + F("penalty_portion")),
+        today=_money("amount", Q(date=today)), today_count=Count("id", filter=Q(date=today)))
+    open_counts = open_loans.aggregate(
+        borrowers=Count("borrower", distinct=True),
+        overdue=Count("id", filter=Q(status__in=[Loan.Status.OVERDUE, Loan.Status.DEFAULTED])))
 
     week_end = today + timedelta(days=7)
     due_week = (live_installments().filter(due_date__range=(today, week_end))
                 .exclude(status=Installment.Status.PAID)
-                .select_related("loan__borrower").annotate(left=REMAINING).order_by("due_date")[:12])
+                .select_related("loan__borrower").annotate(left=REMAINING).order_by("due_date", "id")[:12])
 
     overdue_list = overdue_items()
 
@@ -284,24 +316,23 @@ def dashboard_data(range_key="7d") -> dict:
         "business_name": settings_obj.business_name,
         "currency_symbol": settings_obj.currency_symbol,
         "outstanding": total_outstanding,
-        "lent_all_time": _sum(live_loans(), "principal"),
-        "collected_all_time": _sum(live_payments(), "amount"),
+        "lent_all_time": all_loans["lent"],
+        "collected_all_time": all_pays["collected"],
         "lent_this_month": this_month["lent"],
         "lent_change": pct_change(this_month["lent"], last_month["lent"]),
         "collected_this_month": this_month["collected"],
         "collected_change": pct_change(this_month["collected"], last_month["collected"]),
-        "collected_today": _sum(live_payments().filter(date=today), "amount"),
-        "payments_today": live_payments().filter(date=today).count(),
+        "collected_today": all_pays["today"],
+        "payments_today": all_pays["today_count"],
         "profit_this_month": this_month["profit"],
         "profit_change": pct_change(this_month["profit"], last_month["profit"]),
         "expected_profit_this_month": this_month["expected_profit"],
         "profit_this_year": year_summary["profit"],
         "lent_this_year": year_summary["lent"],
-        "profit_all_time": (_sum(live_payments(), F("interest_portion") + F("penalty_portion"))
-                            + _sum(live_loans(), "processing_fee")),
-        "active_borrowers": open_loans.values("borrower").distinct().count(),
+        "profit_all_time": all_pays["profit"] + all_loans["fees"],
+        "active_borrowers": open_counts["borrowers"],
         "total_borrowers": Borrower.objects.filter(is_active=True).count(),
-        "overdue_count": open_loans.filter(status__in=[Loan.Status.OVERDUE, Loan.Status.DEFAULTED]).count(),
+        "overdue_count": open_counts["overdue"],
         "overdue_amount": _sum(overdue_insts, REMAINING),
         "collection_rate": this_month["collection_rate"],
         "due_this_month": this_month["due_amount"],

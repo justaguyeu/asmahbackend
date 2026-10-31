@@ -2,11 +2,12 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.test import TestCase
 from rest_framework.test import APIClient
 
 from . import reports, services
-from .models import Borrower, BusinessSettings, Installment, Loan, Payment
+from .models import Borrower, BusinessSettings, Installment, Loan, Payment, with_status
 
 D = Decimal
 
@@ -135,6 +136,66 @@ class ReportTests(TestCase):
         rows, totals = reports.monthly_rows(date(2026, 1, 1), date(2026, 3, 31))
         self.assertEqual(len(rows), 3)
         self.assertEqual(totals["profit"], D("25000"))
+
+
+class SpeedTests(TestCase):
+    """The faster queries must give exactly what the simple ones gave."""
+
+    def setUp(self):
+        cache.clear()
+        self.today = date.today()
+
+    def loan(self, name, days_ago, months=3):
+        b = Borrower.objects.create(full_name=name)
+        return services.create_loan(borrower=b, principal=D("300000"), interest_rate=D("10"), interest_type="flat",
+                                    duration_months=months, frequency="monthly",
+                                    date_issued=self.today - timedelta(days=days_ago))
+
+    def test_daily_refresh_only_checks_loans_that_can_change(self):
+        late = self.loan("Late Borrower", 100)      # every installment is past due
+        fresh = self.loan("New Borrower", 0)        # nothing due for a month
+        tomorrow = self.today + timedelta(days=1)
+        self.assertEqual(list(services.loans_to_refresh(tomorrow)), [late])
+        self.assertEqual(services.refresh_open_loans(today=tomorrow), 1)
+        late.refresh_from_db()
+        fresh.refresh_from_db()
+        self.assertEqual(late.checked_on, tomorrow)
+        self.assertEqual(fresh.checked_on, self.today)
+        self.assertEqual(services.refresh_open_loans(today=tomorrow), 0)   # done for the day
+
+    def test_daily_refresh_carries_on_where_it_stopped(self):
+        for n in range(3):
+            self.loan(f"Borrower {n}", 100)
+        tomorrow = self.today + timedelta(days=1)
+        budget = services.REFRESH_BUDGET_SECONDS
+        services.REFRESH_BUDGET_SECONDS = 0  # out of time after every loan
+        try:
+            done = [services.refresh_open_loans(today=tomorrow) for _ in range(4)]
+        finally:
+            services.REFRESH_BUDGET_SECONDS = budget
+        self.assertEqual(done, [1, 1, 1, 0])
+        self.assertFalse(services.loans_to_refresh(tomorrow).exists())
+
+    def test_borrower_status_in_one_query_matches(self):
+        self.loan("Good Borrower", 0)
+        self.loan("Late Borrower", 100)
+        services.set_loan_status(self.loan("Lost Borrower", 100), Loan.Status.DEFAULTED)
+        Borrower.objects.create(full_name="No Loans")
+        listed = {b.full_name: b.status for b in with_status(Borrower.objects.all())}
+        one_by_one = {b.full_name: b.status for b in Borrower.objects.all()}
+        self.assertEqual(listed, one_by_one)
+        self.assertEqual(listed, {"Good Borrower": "good", "Late Borrower": "late", "Lost Borrower": "defaulted",
+                                  "No Loans": "good"})
+
+    def test_chart_matches_period_totals(self):
+        for days_ago in (1, 3, 40, 200):
+            loan = self.loan(f"Borrower {days_ago}", days_ago)
+            services.record_payment(loan=loan, amount=D("50000"), date_paid=self.today)
+        for range_key in ("7d", "30d", "12m"):
+            for bar in reports.chart_series(range_key, self.today):
+                s = reports.period_summary(bar["start"], bar["end"])
+                self.assertEqual((bar["lent"], bar["collected"], bar["profit"]),
+                                 (s["lent"], s["collected"], s["profit"]), (range_key, bar["label"]))
 
 
 class ApiTests(TestCase):

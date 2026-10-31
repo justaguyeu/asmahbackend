@@ -4,7 +4,7 @@ from datetime import date, datetime
 
 from django.core import management
 from django.db import transaction
-from django.db.models import Count, DecimalField, Exists, OuterRef, Q, Sum
+from django.db.models import Count, DecimalField, Q, Sum
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.utils import timezone
@@ -17,7 +17,7 @@ from rest_framework.views import APIView
 
 from . import exports, reports, services
 from .activity import log_activity
-from .models import ZERO, ActivityLog, Borrower, BusinessSettings, Loan, Payment
+from .models import ZERO, ActivityLog, Borrower, BusinessSettings, Loan, Payment, with_status
 from .serializers import (
     ActivityLogSerializer,
     BorrowerSerializer,
@@ -68,7 +68,7 @@ class BorrowerViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.C
 
     def get_queryset(self):
         live = Q(loans__status__in=OPEN)
-        qs = Borrower.objects.annotate(
+        qs = with_status(Borrower.objects).annotate(
             balance=Coalesce(Sum("loans__balance", filter=live), ZERO, output_field=DEC),
             total_borrowed=Coalesce(Sum("loans__principal", filter=~Q(loans__status="void")), ZERO,
                                     output_field=DEC),
@@ -80,16 +80,13 @@ class BorrowerViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.C
             qs = qs.filter(is_active=p.get("archived") != "1")
         if q := p.get("q", "").strip():
             qs = qs.filter(Q(full_name__icontains=q) | Q(phone__icontains=q) | Q(national_id__icontains=q))
-        open_loans = Loan.objects.filter(borrower=OuterRef("pk"), balance__gt=0)
-        late = Exists(open_loans.filter(status=Loan.Status.OVERDUE))
-        bad = Exists(open_loans.filter(status__in=reports.LOST_STATUSES))
         status_filter = p.get("status")
         if status_filter == "defaulted":
-            qs = qs.filter(bad)
+            qs = qs.filter(status_lost=True)
         elif status_filter == "late":
-            qs = qs.filter(late).exclude(bad)
+            qs = qs.filter(status_late=True, status_lost=False)
         elif status_filter == "good":
-            qs = qs.exclude(late).exclude(bad)
+            qs = qs.filter(status_late=False, status_lost=False)
         elif status_filter == "active":
             qs = qs.filter(active_loans__gt=0)
         ordering = {"name": "full_name", "-balance": "-balance", "balance": "balance",
@@ -242,7 +239,8 @@ class LoanViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.Gen
 
     def retrieve(self, request, *args, **kwargs):
         loan = self.get_object()
-        if loan.status not in (Loan.Status.VOID, Loan.Status.COMPLETED):
+        # every change to a loan recalculates it; this only catches up with the passing days
+        if loan.status not in (Loan.Status.VOID, Loan.Status.COMPLETED) and loan.checked_on != timezone.localdate():
             services.recalculate_loan(loan)
         return super().retrieve(request, *args, **kwargs)
 
