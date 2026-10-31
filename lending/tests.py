@@ -278,12 +278,59 @@ class ApiTests(TestCase):
         from django.core import mail
         self.assertEqual(len(mail.outbox), 0)  # no reset link for non-admins
 
-    def test_no_hard_delete(self):
+    def test_delete_only_without_money_history(self):
         self.login("boss")
         b = Borrower.objects.create(full_name="Saida Komba")
-        loan = services.create_loan(borrower=b, principal=D("100000"), interest_rate=D("10"), duration_months=1)
-        self.assertEqual(self.client.delete(f"/api/loans/{loan.id}/").status_code, 405)
-        self.assertEqual(self.client.delete(f"/api/borrowers/{b.id}/").status_code, 405)
+        paid = services.create_loan(borrower=b, principal=D("100000"), interest_rate=D("10"), duration_months=1)
+        services.record_payment(loan=paid, amount=D("10000"))
+        services.void_payment(paid.payments.get(), "test")
+        # money was recorded (even if voided since): the loan and its borrower stay
+        r = self.client.delete(f"/api/loans/{paid.id}/")
+        self.assertEqual((r.status_code, r.data["code"]), (400, "has_payments"))
+        r = self.client.delete(f"/api/borrowers/{b.id}/")
+        self.assertEqual((r.status_code, r.data["code"]), (400, "has_loans"))
+        self.assertFalse(self.client.get(f"/api/loans/{paid.id}/").data["can_delete"])
+        self.assertFalse(self.client.get(f"/api/borrowers/{b.id}/").data["can_delete"])
+
+        # a loan entered by mistake, with no payment, is erased with its schedule
+        c = Borrower.objects.create(full_name="Neema Mollel")
+        mistake = services.create_loan(borrower=c, principal=D("50000"), interest_rate=D("10"), duration_months=2)
+        listed = {l["id"]: l["can_delete"] for l in self.client.get("/api/loans/").data["results"]}
+        self.assertEqual(listed, {paid.id: False, mistake.id: True})
+        self.assertEqual(self.client.delete(f"/api/loans/{mistake.id}/").status_code, 204)
+        self.assertFalse(Loan.objects.filter(pk=mistake.id).exists())
+        self.assertFalse(Installment.objects.filter(loan_id=mistake.id).exists())
+        # ...and then the borrower without loans too
+        listed = {x["full_name"]: x["can_delete"] for x in self.client.get("/api/borrowers/").data["results"]}
+        self.assertEqual(listed, {"Saida Komba": False, "Neema Mollel": True})
+        self.assertEqual(self.client.delete(f"/api/borrowers/{c.id}/").status_code, 204)
+        self.assertFalse(Borrower.objects.filter(pk=c.id).exists())
+        logged = set(self.client.get("/api/activity/").data["results"][i]["action"] for i in range(2))
+        self.assertEqual(logged, {"loan_deleted", "borrower_deleted"})
+
+    def test_edit_loan_terms_reapplies_payments(self):
+        self.login("boss")
+        b = Borrower.objects.create(full_name="Baraka Swai")
+        issued = date.today() - timedelta(days=10)
+        loan = services.create_loan(borrower=b, principal=D("300000"), interest_rate=D("10"), interest_type="flat",
+                                    duration_months=3, frequency="monthly", date_issued=issued)
+        services.record_payment(loan=loan, amount=D("130000"), date_paid=date.today())
+        r = self.client.patch(f"/api/loans/{loan.id}/", {"principal": "600000"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        # 600,000 + 3 x 60,000 interest; the 130,000 already paid counts against the new schedule
+        self.assertEqual(D(str(r.data["total_due"])), D("780000"))
+        self.assertEqual(D(str(r.data["balance"])), D("650000"))
+        self.assertEqual([D(str(i["amount_due"])) for i in r.data["installments"]], [D("260000")] * 3)
+        self.assertEqual(D(str(r.data["installments"][0]["amount_paid"])), D("130000"))
+        self.assertEqual(r.data["status"], "active")
+        self.assertIn("amount 300000.00 -> 600000", self.client.get("/api/activity/").data["results"][0]["description"])
+        # notes alone still work, and a void loan can't be changed
+        self.assertEqual(self.client.patch(f"/api/loans/{loan.id}/", {"notes": "Paid cash"}, format="json").status_code, 200)
+        services.void_loan(loan, "test")
+        r = self.client.patch(f"/api/loans/{loan.id}/", {"principal": "700000"}, format="json")
+        self.assertEqual(r.status_code, 400)
+        r = self.client.patch(f"/api/loans/{loan.id}/", {"first_due_date": str(issued)}, format="json")
+        self.assertEqual(r.status_code, 400)  # must come after the date given
 
     def test_password_reset_flow(self):
         from django.core import mail

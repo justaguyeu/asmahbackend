@@ -152,6 +152,27 @@ def create_loan(*, borrower, principal, interest_rate=None, interest_type=None, 
     return loan
 
 
+@transaction.atomic
+def update_loan_terms(loan: Loan, **terms) -> Loan:
+    """Correct a loan's terms (amount, interest, duration, dates, fee, penalty). The repayment
+    schedule is built again and the payments already received are applied to it again, oldest
+    installment first, so balance, profit and status follow the new terms."""
+    for field, value in terms.items():
+        setattr(loan, field, value)
+    loan.principal = to_money(loan.principal)
+    loan.processing_fee = to_money(loan.processing_fee)
+    if loan.first_due_date is None:
+        loan.first_due_date = default_first_due(loan.date_issued, loan.frequency)
+    loan.save()
+    loan.installments.all().delete()
+    Installment.objects.bulk_create([
+        Installment(loan=loan, **row)
+        for row in build_schedule(loan.principal, loan.interest_rate, loan.interest_type,
+                                  loan.duration_months, loan.frequency, loan.first_due_date)
+    ])
+    return recalculate_loan(loan)
+
+
 def _allocate(installments, payments, *, with_penalty):
     """Walk payments oldest first and fill installments. Returns per-payment split
     and, per installment, the date principal+interest became fully paid."""

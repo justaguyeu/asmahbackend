@@ -34,13 +34,18 @@ class BorrowerSerializer(RelativeImagesMixin, serializers.ModelSerializer):
     total_borrowed = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
     active_loans = serializers.IntegerField(read_only=True)
     loans_count = serializers.IntegerField(read_only=True)
+    can_delete = serializers.SerializerMethodField()
 
     class Meta:
         model = Borrower
         fields = ["id", "full_name", "phone", "national_id", "address", "photo", "guarantor_name",
                   "guarantor_phone", "notes", "is_active", "created_at", "status", "balance",
-                  "total_borrowed", "active_loans", "loans_count"]
+                  "total_borrowed", "active_loans", "loans_count", "can_delete"]
         read_only_fields = ["created_at"]
+
+    def get_can_delete(self, b):
+        """Erasing is only for a borrower without any loan (not even a voided one)."""
+        return not (b.has_loans if hasattr(b, "has_loans") else b.loans.exists())
 
     def validate_full_name(self, value):
         value = " ".join(value.split())
@@ -94,6 +99,7 @@ class LoanListSerializer(serializers.ModelSerializer):
     borrower_phone = serializers.CharField(source="borrower.phone", read_only=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     interest_type_display = serializers.CharField(source="get_interest_type_display", read_only=True)
+    can_delete = serializers.SerializerMethodField()
 
     class Meta:
         model = Loan
@@ -101,7 +107,11 @@ class LoanListSerializer(serializers.ModelSerializer):
                   "interest_rate", "interest_type", "interest_type_display", "duration_months", "frequency",
                   "date_issued", "first_due_date", "processing_fee", "total_interest", "total_penalty",
                   "total_due", "total_paid", "balance", "overpayment", "status", "status_display",
-                  "completed_on", "created_at"]
+                  "completed_on", "created_at", "can_delete"]
+
+    def get_can_delete(self, loan):
+        """Erasing is only for a loan without any payment (not even a voided one)."""
+        return not (loan.has_payments if hasattr(loan, "has_payments") else loan.payments.exists())
 
 
 class LoanDetailSerializer(LoanListSerializer):
@@ -118,6 +128,37 @@ class LoanDetailSerializer(LoanListSerializer):
             "installments", "payments", "disbursed_amount", "principal_paid", "interest_paid",
             "days_late", "penalty_type", "penalty_value", "penalty_grace_days", "notes", "void_reason",
             "status_locked", "created_by_name"]
+
+
+class LoanUpdateSerializer(serializers.Serializer):
+    """Changes to an existing loan: its notes, or corrected terms (services.update_loan_terms)."""
+    principal = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("1"), required=False)
+    interest_rate = serializers.DecimalField(max_digits=6, decimal_places=2, min_value=Decimal("0"),
+                                             max_value=Decimal("100"), required=False)
+    interest_type = serializers.ChoiceField(choices=["flat", "reducing"], required=False)
+    duration_months = serializers.IntegerField(min_value=1, max_value=120, required=False)
+    frequency = serializers.ChoiceField(choices=["monthly", "weekly"], required=False)
+    date_issued = serializers.DateField(required=False)
+    first_due_date = serializers.DateField(required=False, allow_null=True)
+    processing_fee = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("0"), required=False)
+    penalty_type = serializers.ChoiceField(choices=["percent", "fixed"], required=False)
+    penalty_value = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("0"), required=False)
+    penalty_grace_days = serializers.IntegerField(min_value=0, max_value=365, required=False)
+    notes = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+
+    def validate(self, attrs):
+        loan = self.instance  # the values that are not being changed
+        principal = attrs.get("principal", loan.principal)
+        if attrs.get("processing_fee", loan.processing_fee) >= principal:
+            raise serializers.ValidationError({"processing_fee": "Fee must be less than the loan amount."})
+        issued = attrs.get("date_issued", loan.date_issued)
+        first_due = attrs.get("first_due_date", loan.first_due_date)
+        if first_due and first_due <= issued:
+            raise serializers.ValidationError({"first_due_date": "First due date must be after the issue date."})
+        penalty_type = attrs.get("penalty_type", loan.penalty_type)
+        if penalty_type == "percent" and attrs.get("penalty_value", loan.penalty_value) > 100:
+            raise serializers.ValidationError({"penalty_value": "A percentage penalty can be at most 100."})
+        return attrs
 
 
 class LoanCreateSerializer(serializers.Serializer):

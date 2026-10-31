@@ -4,7 +4,7 @@ from datetime import date, datetime
 
 from django.core import management
 from django.db import transaction
-from django.db.models import Count, DecimalField, Q, Sum
+from django.db.models import Count, DecimalField, Exists, OuterRef, Q, Sum
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.utils import timezone
@@ -24,6 +24,7 @@ from .serializers import (
     BulkLoanSerializer,
     BusinessSettingsSerializer,
     LoanCreateSerializer,
+    LoanUpdateSerializer,
     LoanDetailSerializer,
     LoanListSerializer,
     LoanPreviewSerializer,
@@ -61,6 +62,16 @@ def period_from_request(request):
     return start, end
 
 
+# whether a loan has any payment (void ones too): only a loan without one can be erased
+HAS_PAYMENTS = Exists(Payment.objects.filter(loan=OuterRef("pk")))
+
+# how the activity log names a changed loan term
+TERM_NAMES = {"principal": "amount", "interest_rate": "interest %", "interest_type": "interest type",
+              "duration_months": "months", "frequency": "repayments", "date_issued": "date given",
+              "first_due_date": "first due", "processing_fee": "fee", "penalty_type": "penalty type",
+              "penalty_value": "penalty", "penalty_grace_days": "grace days"}
+
+
 class BorrowerViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.CreateModelMixin,
                       mixins.UpdateModelMixin, viewsets.GenericViewSet):
     serializer_class = BorrowerSerializer
@@ -69,6 +80,7 @@ class BorrowerViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.C
     def get_queryset(self):
         live = Q(loans__status__in=OPEN)
         qs = with_status(Borrower.objects).annotate(
+            has_loans=Exists(Loan.objects.filter(borrower=OuterRef("pk"))),
             balance=Coalesce(Sum("loans__balance", filter=live), ZERO, output_field=DEC),
             total_borrowed=Coalesce(Sum("loans__principal", filter=~Q(loans__status="void")), ZERO,
                                     output_field=DEC),
@@ -100,6 +112,24 @@ class BorrowerViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.C
     def perform_update(self, serializer):
         b = serializer.save()
         log_activity(self.request.user, "borrower_updated", "borrower", b.pk, f"Updated borrower {b.full_name}")
+
+    def destroy(self, request, pk=None):
+        """Erase a borrower added by mistake. Only while they have no loan at all; after that they
+        can only be archived, so the money records stay complete."""
+        b = self.get_object()
+        if b.loans.exists():
+            return Response({"code": "has_loans",
+                             "detail": f"{b.full_name} has loans, so they can't be deleted. Archive them instead."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        name = b.full_name
+        if b.photo:
+            try:
+                b.photo.delete(save=False)
+            except Exception:  # a photo that can't be removed from storage must not block this
+                pass
+        b.delete()
+        log_activity(request.user, "borrower_deleted", "borrower", pk, f"Deleted borrower {name} (no loans)")
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["post"])
     def archive(self, request, pk=None):
@@ -195,7 +225,7 @@ class BorrowerViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.C
     @action(detail=True, methods=["get"])
     def history(self, request, pk=None):
         b = self.get_object()
-        loans = b.loans.order_by("-date_issued", "-id")
+        loans = b.loans.annotate(has_payments=HAS_PAYMENTS).order_by("-date_issued", "-id")
         pays = Payment.objects.filter(loan__borrower=b).select_related("loan", "received_by", "voided_by")
         return Response({"loans": LoanListSerializer(loans, many=True).data,
                          "payments": PaymentSerializer(pays, many=True).data})
@@ -206,10 +236,12 @@ class LoanViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.Gen
         return LoanDetailSerializer if self.action == "retrieve" else LoanListSerializer
 
     def get_queryset(self):
-        qs = Loan.objects.select_related("borrower", "created_by")
+        qs = Loan.objects.select_related("borrower", "created_by").annotate(has_payments=HAS_PAYMENTS)
         if self.action == "retrieve":
             return qs.prefetch_related("installments", "payments__received_by", "payments__voided_by",
                                        "payments__loan__borrower")
+        if self.action != "list":  # editing, voiding or deleting works on any loan, void ones too
+            return qs
         p = self.request.query_params
         status_filter = p.get("status")
         if status_filter == "open":
@@ -266,11 +298,35 @@ class LoanViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.Gen
 
     def partial_update(self, request, pk=None):
         loan = self.get_object()
-        if "notes" in request.data:
-            loan.notes = str(request.data["notes"])[:2000]
+        ser = LoanUpdateSerializer(loan, data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        data = dict(ser.validated_data)
+        if "notes" in data:
+            loan.notes = data.pop("notes")
             loan.save(update_fields=["notes"])
             log_activity(request.user, "loan_updated", "loan", loan.pk, f"Updated notes on {loan.reference}")
-        return Response(LoanDetailSerializer(loan).data)
+        changes = {k: v for k, v in data.items() if getattr(loan, k) != v}
+        if changes:
+            if loan.status == Loan.Status.VOID:
+                raise ValidationError({"detail": "A void loan can't be changed."})
+            before = {k: getattr(loan, k) for k in changes}
+            services.update_loan_terms(loan, **changes)
+            log_activity(request.user, "loan_updated", "loan", loan.pk, f"Changed {loan.reference}: " + ", ".join(
+                f"{TERM_NAMES[k]} {before[k]} -> {v}" for k, v in changes.items()))
+        return Response(LoanDetailSerializer(self.get_queryset().get(pk=loan.pk)).data)
+
+    def destroy(self, request, pk=None):
+        """Erase a loan entered by mistake. Only while it has no payment at all (not even a voided
+        one); after that it can only be voided, so the money records stay complete."""
+        loan = self.get_object()
+        if loan.payments.exists():
+            return Response({"code": "has_payments",
+                             "detail": "This loan has payments, so it can't be deleted. Void it instead."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        reference, name = loan.reference, loan.borrower.full_name
+        loan.delete()  # its schedule (installments) goes with it
+        log_activity(request.user, "loan_deleted", "loan", pk, f"Deleted loan {reference} of {name} (no payments)")
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=False, methods=["post"])
     def preview(self, request):
